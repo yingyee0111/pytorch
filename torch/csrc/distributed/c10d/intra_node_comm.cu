@@ -23,10 +23,6 @@ static constexpr size_t kHcmThreshBytes = 256 * 1024;
 static constexpr size_t kOneShotThreshBytes = 256 * 1024;
 static constexpr size_t kTwoShotThreshBytes = 10 * 1024 * 1024;
 
-#if defined(USE_ROCM)
-using __nv_bfloat162 = __hip_bfloat162;
-#endif
-
 struct __align__(16) bf16x8 {
   __nv_bfloat162 vals[4];
 };
@@ -35,12 +31,14 @@ struct __align__(16) bf16x8 {
 
 DEVICE_INLINE __nv_bfloat162
 bf16hadd2(const __nv_bfloat162 x, const __nv_bfloat162 y) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
+#if defined(USE_ROCM)
+  return bf16hadd2(x, y);
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
   CUDA_KERNEL_ASSERT(false);
   __nv_bfloat162 res;
   return res;
 #else
-  return __hadd2(x, y);
+  return reinterpret_cast<__nv_bfloat162>(__hadd2(x, y));
 #endif
 }
 
