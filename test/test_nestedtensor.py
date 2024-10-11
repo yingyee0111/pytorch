@@ -4,6 +4,7 @@ import ast
 import io
 import itertools
 import math
+import random
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,11 @@ from torch.nested._internal.nested_tensor import (
     NestedTensor,
     ViewNestedFromBuffer,
 )
+from torch.nn.attention.flex_attention import (
+    create_njt_block_mask,
+    flex_attention,
+    njt_mask_mod_adapter,
+)
 from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FUSED_ATTENTION,
     SM70OrLater,
@@ -33,6 +39,7 @@ from torch.testing._internal.common_cuda import (
 from torch.testing._internal.common_device_type import (
     dtypes,
     dtypesIfCUDA,
+    flex_attention_supported_platform,
     instantiate_device_type_tests,
     onlyCPU,
     onlyCUDA,
@@ -6968,6 +6975,60 @@ class TestNestedTensorSubclass(NestedTensorTestCase):
         attn_output_eager.sum().backward()
         self.assertTrue(torch.allclose(attn_output_eager, attn_output))
         self.assertTrue(torch.allclose(value_grad, value.grad))
+
+    @flex_attention_supported_platform
+    @dtypes(torch.float32)
+    def test_flex_attention(self, device, dtype):
+        def causal_mask(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        batch_size = 8
+        n_heads = 8
+        D = 16
+
+        sentence_lengths = [random.randint(1, 1023) for _ in range(batch_size - 1)]
+        total = sum(sentence_lengths)
+
+        # shape (B, *, D_total) where D_total = n_heads * D
+        query = torch.nested.nested_tensor(
+            [torch.randn(l, n_heads * D, device="cuda") for l in sentence_lengths],
+            layout=torch.jagged,
+        )
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+
+        # shape (B, *, D_total) -> (B, n_heads, *, D)
+        query = (
+            query.unflatten(-1, [n_heads, D]).transpose(1, 2).detach().requires_grad_()
+        )
+        key = key.unflatten(-1, [n_heads, D]).transpose(1, 2).detach().requires_grad_()
+        value = (
+            value.unflatten(-1, [n_heads, D]).transpose(1, 2).detach().requires_grad_()
+        )
+
+        # Build the seq_idx lookup table for query's offsets
+        njt_causal_mask = njt_mask_mod_adapter(causal_mask, query)
+        block_mask = create_njt_block_mask(njt_causal_mask, 1, 1, query, _compile=True)
+
+        # Run FlexAttention with a causal mask
+        out_flex = flex_attention(query, key, value, block_mask=block_mask)
+        grad_out = torch.randn_like(out_flex)
+        grads_flex = torch.autograd.grad(
+            out_flex, inputs=(query, key, value), grad_outputs=(grad_out,)
+        )
+        flex_outs = [out_flex, *grads_flex]
+
+        # Run causal SDPA for comparison
+        out_sdpa = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+        grads_sdpa = torch.autograd.grad(
+            out_sdpa, inputs=(query, key, value), grad_outputs=(grad_out,)
+        )
+        sdpa_outs = [out_sdpa, *grads_sdpa]
+
+        # Compare flex vs. SDPA output and grads
+        for flex, sdpa in zip(flex_outs, sdpa_outs):
+            self.assertTrue(flex.is_nested and sdpa.is_nested)
+            self.assertEqual(flex, sdpa, atol=1e-2, rtol=1e-2)
 
     @dtypes(torch.float32)
     def test_apply_(self, device, dtype):

@@ -29,8 +29,10 @@ __all__ = [
     "flex_attention",
     "create_block_mask",
     "create_mask",
+    "create_njt_block_mask",
     "or_masks",
     "and_masks",
+    "njt_mask_mod_adapter",
     "noop_mask",
 ]
 
@@ -897,6 +899,118 @@ def _create_empty_block_mask(query: Tensor, key: Tensor) -> BlockMask:
     )
 
 
+# TODO: Add njt_score_mod_adapter too
+
+
+def njt_mask_mod_adapter(
+    orig_mask_mod: _mask_mod_signature,
+    njt: torch.Tensor,
+):
+    r"""Adapter to convert a mask_mod to an NJT-compatible mask_mod. The given mask_mod
+    should be written as if operating over a single sequence at a item. This adapter will
+    handle conversion from indices operating over a "stacked sequence" of length ``sum(S)``
+    for sequence length ``S`` in the NJT to "sequence relative" indices in range ``[0, S)``.
+
+    Args:
+        orig_mask_mod (Callable):  mask_mod function. This is a callable that defines the
+            masking pattern for the attention mechanism. It takes four arguments:
+            b (batch size), h (number of heads), q_idx (query index), and kv_idx (key/value index).
+            It should return a boolean tensor indicating which attention connections are allowed
+            (True) or masked out (False).
+        njt (torch.Tensor): Jagged layout nested tensor (NJT) that defines the sequence length
+            structure for query / key / value.
+
+    Returns:
+        njt_mask_mod: An NJT-compatible version of orig_mask_mod
+    """
+
+    # Used to convert indices within the "stacked" sequence (range [0, sum(*)))
+    # to "sequence local" indices (range [0, S) for each S).
+    def _build_seq_idx(offsets, total_length):
+        range_tensor = torch.arange(
+            total_length, device=offsets.device, dtype=torch.int32
+        )
+
+        # Use searchsorted to find the index for each position
+        # NB: This assumes offsets[0] to offsets[-1] spans the packed dim of values.
+        # If we ever loosen this restriction, this logic will need to be updated.
+        seq_idx = torch.searchsorted(offsets, range_tensor, right=True) - 1
+        return seq_idx
+
+    offsets = njt._offsets  # type: ignore[attr-defined]
+    total_length = njt._values.shape[njt._ragged_idx - 1]  # type: ignore[attr-defined]
+    seq_idx = _build_seq_idx(offsets, total_length)
+
+    def njt_mask_mod(b, h, q_idx, kv_idx):
+        # Converts q_idx / kv_idx from [0, total_length) -> [0, S), where S refers
+        # to the sequence length for each sequence in the NJT, for use in given
+        # mask_mod. This allows the user to write a mask_mod as if it were
+        # operating on a single sequence and the "stacked sequence" is split
+        # automatically into individual sequences for them.
+        q_nested = q_idx - offsets[seq_idx[q_idx]]
+        kv_nested = kv_idx - offsets[seq_idx[kv_idx]]
+        is_same_sequence = seq_idx[q_idx] == seq_idx[kv_idx]
+        return orig_mask_mod(b, h, q_nested, kv_nested) & is_same_sequence
+
+    return njt_mask_mod
+
+
+def create_njt_block_mask(
+    njt_mask_mod: _mask_mod_signature,
+    B: Optional[int],
+    H: Optional[int],
+    njt: torch.Tensor,
+    BLOCK_SIZE: Union[int, Tuple[int, int]] = _DEFAULT_SPARSE_BLOCK_SIZE,
+    _compile=False,
+) -> BlockMask:
+    r"""This function creates a block mask tuple from a mask_mod function. The given mask_mod
+    is expected to be NJT-compatible (i.e. an output from ``njt_mask_mod_adapter()``). The
+    returned BlockMask will be on the device specified by the input NJT.
+
+    Args:
+        njt_mask_mod (Callable): mask_mod function. This is a callable that defines the
+            masking pattern for the attention mechanism. It takes four arguments:
+            b (batch size), h (number of heads), q_idx (query index), and kv_idx (key/value index).
+            It should return a boolean tensor indicating which attention connections are allowed
+            (True) or masked out (False).
+        B (int): Batch size.
+        H (int): Number of query heads.
+        njt (torch.Tensor): Jagged layout nested tensor (NJT) that defines the sequence length
+            structure for query / key / value. The block mask will be constructed to operate on
+            a "stacked sequence" of length ``sum(S)`` for sequence length ``S`` from the NJT.
+        BLOCK_SIZE (int or Tuple[int, int]): Block size for the block mask. If a single int is
+            provided it is used for both query and key/value.
+
+    Returns:
+        BlockMask:  A BlockMask object that contains the block mask information.
+
+    Example Usage:
+        .. code-block:: python
+
+            def causal_mask(b, h, q_idx, kv_idx):
+                return q_idx >= kv_idx
+
+            njt_causal_mask = njt_mask_mod_adapter(causal_mask, njt)
+            block_mask = create_njt_block_mask(njt_causal_mask, 1, 1, njt, device="cuda")
+            query = torch.randn(1, 1, 8192, 64, device="cuda", dtype=torch.float16)
+            key = torch.randn(1, 1, 8192, 64, device="cuda", dtype=torch.float16)
+            value = torch.randn(1, 1, 8192, 64, device="cuda", dtype=torch.float16)
+            output = flex_attention(query, key, value, block_mask=block_mask)
+    """
+    return create_block_mask(
+        njt_mask_mod,
+        B,
+        H,
+        njt._values.shape[njt._ragged_idx - 1],  # type: ignore[attr-defined]
+        njt._values.shape[njt._ragged_idx - 1],  # type: ignore[attr-defined]
+        device=njt.device,  # type: ignore[arg-type]
+        # compile is important so we don't materialize a mask_tensor of
+        # shape (1, 1, total_seqlen, total_seqlen)
+        BLOCK_SIZE=BLOCK_SIZE,
+        _compile=_compile,
+    )
+
+
 def _apply_kernel_options(
     query: Tensor, key: Tensor, value: Tensor, return_lse: bool, kernel_options
 ):
@@ -1030,11 +1144,13 @@ def flex_attention(
                 f"but got Hq={Hq} and Hkv={Hkv}."
             )
 
+    from torch.fx.experimental.symbolic_shapes import is_nested_int
+
     if score_mod is None:
         score_mod = _identity
     if block_mask is None:
         block_mask = _create_empty_block_mask(query, key)
-    elif (
+    elif not is_nested_int(query.size(-2)) and (
         query.size(-2) < block_mask.kv_num_blocks.size(-1) * block_mask.BLOCK_SIZE[0]
         or key.size(-2) < block_mask.kv_indices.size(-1) * block_mask.BLOCK_SIZE[1]
     ):
