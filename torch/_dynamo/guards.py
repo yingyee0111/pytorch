@@ -2068,8 +2068,8 @@ class GuardBuilder(GuardBuilderBase):
         func_name = getframeinfo(caller)[2]
         del caller
         # We use func_name for export, so might as well get a nice defensive check out of it
-        assert func_name in dir(
-            self.__class__
+        assert (
+            func_name in dir(self.__class__)
         ), f"_produce_guard_code must be called from inside GuardedCode. Called from {func_name}"
 
         # Not all guards have names, some can be installed globally (see asserts on HAS_GRAD)
@@ -2085,8 +2085,8 @@ class GuardBuilder(GuardBuilderBase):
         )
         obj_ref = None
         # Not necessary to have weakref for Enum type, but there is a bug that
-        # makes hasattr(guarded_object.__class__, "__weakref__") return True.
-        if hasattr(guarded_object.__class__, "__weakref__") and not isinstance(
+        # makes hasattr(guarded_object, "__weakref__") return True.
+        if hasattr(guarded_object, "__weakref__") and not isinstance(
             guarded_object, enum.Enum
         ):
             obj_ref = weakref.ref(guarded_object)
