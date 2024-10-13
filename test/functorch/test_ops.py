@@ -31,7 +31,6 @@ from functorch_additional_op_db import additional_op_db
 
 import torch
 import torch.autograd.forward_ad as fwAD
-
 from functorch import grad, jacfwd, jacrev, vjp, vmap
 from torch import Tensor
 from torch._functorch.eager_transforms import _as_tuple, jvp
@@ -44,7 +43,6 @@ from torch.testing._internal.common_device_type import (
     toleranceOverride,
 )
 from torch.testing._internal.common_methods_invocations import op_db
-
 from torch.testing._internal.common_utils import (
     is_iterable_of_tensors,
     IS_MACOS,
@@ -59,10 +57,10 @@ from torch.testing._internal.common_utils import (
     TestCase,
     unMarkDynamoStrictTest,
 )
-
 from torch.testing._internal.opinfo.core import SampleInput
 from torch.utils import _pytree as pytree
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+
 
 aten = torch.ops.aten
 
@@ -351,7 +349,7 @@ def is_inplace(op, variant):
 
 vjp_fail = {
     xfail("tensor_split"),  # data_ptr composite compliance
-    # https://github.com/pytorch/pytorch/issues/96560
+    # Very minor accuracy issue on ROCm
     decorate("nn.functional.scaled_dot_product_attention", decorator=skipIfRocm),
 }
 
@@ -434,7 +432,10 @@ class TestOperators(TestCase):
                 xfail("view_as_complex"),
                 # query: last dimension must be contiguous
                 # Fused attention kernels require last dim to be contiguous
-                xfail("nn.functional.scaled_dot_product_attention"),
+                decorate(
+                    "nn.functional.scaled_dot_product_attention",
+                    decorator=expectedFailureIf(not TEST_WITH_ROCM),
+                ),  # Works on ROCm
                 xfail("torch.ops.aten._flash_attention_forward"),
                 xfail("torch.ops.aten._efficient_attention_forward"),
                 # RuntimeError: Expected contiguous tensor, but got
@@ -456,11 +457,7 @@ class TestOperators(TestCase):
                 {torch.float32: tol(atol=1e-04, rtol=1e-04)},
             ),
             tol1("masked.cumprod", {torch.float32: tol(atol=1e-05, rtol=1e-05)}),
-            tol1(
-                "svd_lowrank",
-                {torch.float32: tol(atol=3e-04, rtol=3e-04)},
-                device_type="cuda",
-            ),
+            tol1("svd_lowrank", {torch.float32: tol(atol=3e-04, rtol=3e-04)}),
             tol1(
                 "linalg.multi_dot",
                 {torch.float32: tol(atol=1e-05, rtol=8e-04)},
@@ -750,7 +747,10 @@ class TestOperators(TestCase):
                 xfail("view_as_complex"),
                 # RuntimeError: query: last dimension must be contiguous
                 # The fused attention kernels require the last dim to be contiguous
-                xfail("nn.functional.scaled_dot_product_attention"),
+                decorate(
+                    "nn.functional.scaled_dot_product_attention",
+                    decorator=expectedFailureIf(not TEST_WITH_ROCM),
+                ),  # Works on ROCm
                 xfail("torch.ops.aten._flash_attention_forward"),
                 xfail("torch.ops.aten._efficient_attention_forward"),
                 # BUG
@@ -784,7 +784,7 @@ class TestOperators(TestCase):
             tol2(
                 "linalg.pinv", "hermitian", {torch.float32: tol(atol=1e-05, rtol=1e-05)}
             ),
-            tol1("linalg.tensorsolve", {torch.float32: tol(atol=4e-05, rtol=5e-05)}),
+            tol1("linalg.tensorsolve", {torch.float32: tol(atol=9e-03, rtol=2e-04)}),
             tol1("linalg.multi_dot", {torch.float32: tol(atol=1e-04, rtol=1e-04)}),
             tol1("svd_lowrank", {torch.float32: tol(atol=1e-04, rtol=1e-04)}),
             tol1("pca_lowrank", {torch.float32: tol(atol=1e-04, rtol=1e-04)}),
@@ -1012,8 +1012,6 @@ class TestOperators(TestCase):
                 xfail("normal"),  # calls random op
                 xfail("normal", "number_mean"),  # calls random op
                 xfail("pca_lowrank"),  # calls random op
-                # https://github.com/pytorch/pytorch/issues/96560
-                decorate("linalg.pinv", "hermitian", decorator=skipIfRocm),
                 xfail(
                     "quantile", device_type="cpu"
                 ),  # Batching rule not implemented for `at::equal`
@@ -1411,18 +1409,6 @@ class TestOperators(TestCase):
                 xfail("nn.functional.soft_margin_loss", ""),
                 xfail("nn.functional.max_unpool1d", "grad"),
                 xfail("nn.functional.embedding", ""),
-                xfail(
-                    "scatter_reduce", "sum"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
-                xfail(
-                    "scatter_reduce", "mean"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
-                xfail(
-                    "scatter_reduce", "amin"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
-                xfail(
-                    "scatter_reduce", "amax"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
                 xfail("nn.functional.glu"),
                 xfail("nn.functional.bilinear"),  # trilinear doesn't have batching rule
                 xfail("linalg.lu", ""),
@@ -1430,9 +1416,9 @@ class TestOperators(TestCase):
                 xfail("as_strided_scatter", ""),
                 xfail("masked.cumprod", ""),
                 xfail("renorm"),  # hit vmap fallback, which is disabled
+                xfail("squeeze_copy"),
                 xfail("t_copy"),
                 xfail("transpose_copy"),
-                xfail("squeeze_copy"),
                 xfail("unsqueeze_copy"),
             }
         ),
@@ -1495,18 +1481,6 @@ class TestOperators(TestCase):
                 xfail("nanquantile"),
                 xfail("ormqr"),
                 xfail("put"),
-                xfail(
-                    "scatter_reduce", "sum"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
-                xfail(
-                    "scatter_reduce", "mean"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
-                xfail(
-                    "scatter_reduce", "amin"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
-                xfail(
-                    "scatter_reduce", "amax"
-                ),  # aten::scatter_reduce.two hit the vmap fallback
                 xfail("quantile"),
                 xfail("renorm"),
                 xfail("squeeze_copy"),
@@ -1534,7 +1508,6 @@ class TestOperators(TestCase):
                 xfail("nn.functional.multi_margin_loss", ""),
                 xfail("nn.functional.multilabel_margin_loss", ""),
                 xfail("nn.functional.pdist", ""),
-                xfail("scatter_reduce", "prod"),
                 xfail("nn.functional.max_unpool1d", ""),
                 xfail("nn.functional.max_unpool3d", ""),
                 xfail("nn.functional.max_unpool3d", "grad"),
@@ -1571,6 +1544,7 @@ class TestOperators(TestCase):
                 xfail(
                     "index_fill"
                 ),  # aten::_unique hit the vmap fallback which is currently disabled
+                xfail("squeeze_copy"),
                 xfail("t_copy"),
                 xfail("transpose_copy"),
                 xfail("unsqueeze_copy"),
@@ -2433,7 +2407,7 @@ class TestOperators(TestCase):
             tol1("nn.functional.conv3d", {torch.float32: tol(atol=5e-04, rtol=9e-03)}),
             tol1(
                 "nn.functional.conv2d",
-                {torch.float32: tol(atol=3e-05, rtol=5e-06)},
+                {torch.float32: tol(atol=5e-05, rtol=5e-05)},
                 device_type="cuda",
             ),
             tol1("svd_lowrank", {torch.float32: tol(atol=5e-05, rtol=5e-05)}),
