@@ -1,5 +1,6 @@
 #include <ATen/ThreadLocalState.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/distributed/c10d/RankLocal.hpp>
 
 #include <c10/util/Logging.h>
 #include <fmt/format.h>
@@ -115,7 +116,9 @@ ProcessGroup::ProcessGroup(
 ProcessGroup::ProcessGroup(int rank, int size)
     : rank_(rank), size_(size), backendType_(BackendType::UNDEFINED) {}
 
-ProcessGroup::~ProcessGroup() = default;
+ProcessGroup::~ProcessGroup() {
+  c10d::unregister_completed_works();
+}
 
 void ProcessGroup::init() {
   C10_LOG_API_USAGE_ONCE(
@@ -155,6 +158,131 @@ void ProcessGroup::release_resources() {
   store_.reset();
   deviceTypeToBackend_.clear();
   backendTypeToBackend_.clear();
+}
+
+} // namespace c10d
+
+namespace {
+
+class WorkRegistry {
+ public:
+  void register_work(
+      const at::Tensor& tensor,
+      const c10::intrusive_ptr<c10d::Work>& work) {
+    auto storage = tensor.storage().getWeakStorageImpl();
+    std::unique_lock lock(lock_);
+
+    auto it = registry_.find(storage);
+    if (it == registry_.end()) {
+      registry_.emplace(
+          std::move(storage),
+          std::vector<c10::intrusive_ptr<c10d::Work>>{work});
+    } else {
+      // There is no guarantee that the previous work object for this
+      // tensor storage is completed before the new work object is registered.
+      // Therefore we need to maintain a list of work objects for each tensor
+      // storage.
+      it->second.push_back(work);
+    }
+  }
+
+  std::vector<c10::intrusive_ptr<c10d::Work>> pop_works(
+      const at::Tensor& tensor) {
+    const auto storage = tensor.storage().getWeakStorageImpl();
+    std::unique_lock lock(lock_);
+    auto it = registry_.find(storage);
+    if (it == registry_.end()) {
+      return {};
+    }
+    auto works = it->second;
+    registry_.erase(it);
+    return works;
+  }
+
+  void unregister_completed_works() {
+    std::unique_lock lock(lock_);
+    for (auto it = registry_.begin(); it != registry_.end();) {
+      std::vector<c10::intrusive_ptr<c10d::Work>> uncompleted_works;
+      for (const auto& work : it->second) {
+        if (work.defined() && !work->isCompleted()) {
+          uncompleted_works.push_back(work);
+        }
+      }
+      if (uncompleted_works.empty()) {
+        it = registry_.erase(it);
+      } else {
+        it->second = std::move(uncompleted_works);
+        ++it;
+      }
+    }
+  }
+
+  size_t get_work_registry_size() {
+    std::unique_lock lock(lock_);
+    size_t total_size = 0;
+    for (const auto& [storage, works] : registry_) {
+      total_size += works.size();
+    }
+    return total_size;
+  }
+
+  ~WorkRegistry() {
+    // If there are still unwaited work objects, their corresponding process
+    // groups should have already been destroyed at this stage. Any attempts to
+    // wait for these work objects or to destroy them will only result in
+    // confusing errors. Therefore, we simply issue a warning and intentionally
+    // allow the unwaited work objects to leak.
+    size_t registry_size = get_work_registry_size();
+    if (registry_size > 0) {
+      TORCH_WARN(
+          "At the time of process termination, there are still ",
+          registry_size,
+          " unwaited c10d_functional collective calls. "
+          "Please review your program to ensure c10d_functional.wait_tensor() "
+          "is invoked on all tensors returned from c10d_functional collective "
+          "ops before they are used.");
+    }
+    for (auto& it : registry_) {
+      for (auto& work : it.second) {
+        work.release();
+      }
+    }
+  }
+
+ private:
+  std::unordered_map<
+      c10::weak_intrusive_ptr<c10::StorageImpl>,
+      std::vector<c10::intrusive_ptr<c10d::Work>>>
+      registry_;
+  std::mutex lock_;
+};
+
+static WorkRegistry process_registry;
+
+} // namespace
+
+namespace c10d {
+
+void register_work(
+    const at::Tensor& tensor,
+    const c10::intrusive_ptr<c10d::Work>& work) {
+  RankLocal<WorkRegistry>::get().register_work(tensor, work);
+}
+
+at::Tensor wait_tensor(const at::Tensor& tensor) {
+  auto works = RankLocal<WorkRegistry>::get().pop_works(tensor);
+  for (const auto& work : works) {
+    work->wait();
+  }
+  return tensor;
+}
+
+void unregister_completed_works() {
+  RankLocal<WorkRegistry>::get().unregister_completed_works();
+}
+
+size_t get_work_registry_size() {
+  return RankLocal<WorkRegistry>::get().get_work_registry_size();
 }
 
 } // namespace c10d
