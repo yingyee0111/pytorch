@@ -2211,7 +2211,7 @@ class FlexAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
         )
 
 
-class FlexAttentionAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
+class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
     @staticmethod
     def normalize_to_args(args, kwargs):
         # input signature is (query, key, value, score_mod, block_mask, *other_buffers),
