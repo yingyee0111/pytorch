@@ -467,11 +467,8 @@ def forward_block_mn(
         k = tl.load(K_block_ptr)
     else:
         k = tl.load(K_block_ptr, boundary_check=(1,), padding_option = "zero")
-    # -- compute qk ---
-    qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION) # TODO: use cuda matmul when q_len <= 2.
-    if not PRESCALE_QK:
-        qk *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+
+    # ~~~~~~~~~~~~~~~~~~~ Apply k modification  ~~~~~~~~~~~~~~~~~~~
     if CHECK_BLOCK_BOUNDARY:
         # If this is the last block of a non divisible seqlen, we still need to load [BLOCK_M, BLOCK_N] elements,
         # which is larger than the actual number of elements. To avoid access memory out of bound,
@@ -482,16 +479,34 @@ def forward_block_mn(
         m = offs_m
         n = offs_n
 
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb = inner[:, None]
+
     {{ modification(
         subgraph_number=0,
-        output_name="post_mod_scores",
-        score="qk",
+        output_name="k",
+        score="k",
         b="off_z",
         h="off_h",
-        m="m",
+        m="emb",
         n="n",
-        out="qk"
     ) | indent_except_first(1) }}
+    # -- compute qk ---
+    qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION) # TODO: use cuda matmul when q_len <= 2.
+    if not PRESCALE_QK:
+        qk *= SM_SCALE
+    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+    # if CHECK_BLOCK_BOUNDARY:
+    #     # If this is the last block of a non divisible seqlen, we still need to load [BLOCK_M, BLOCK_N] elements,
+    #     # which is larger than the actual number of elements. To avoid access memory out of bound,
+    #     # we need to mask out the elements that are out of Q_LEN & KV_LEN.
+    #     m = offs_m % Q_LEN
+    #     n = offs_n % KV_LEN
+    # else:
+    #     m = offs_m
+    #     n = offs_n
+
+    post_mod_scores = qk
 
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
@@ -1339,27 +1354,34 @@ def bwd_dq_block_mn(
         kT = tl.load(kT_ptrs)
     else:
         kT = tl.load(kT_ptrs, mask=offs_n2[None, :] < KV_LEN)
-    qk = tl.dot(q, kT, input_precision=FLOAT32_PRECISION)
-    if not PRESCALE_QK:
-        qk *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-    pre_mod_scores = qk
+
     if CHECK_BLOCK_BOUNDARY:
         m = offs_m2[:, None] % Q_LEN
         n = offs_n2[None, :] % KV_LEN
     else:
         m = offs_m2[:, None]
         n = offs_n2[None, :]
+
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb = inner[:, None]
+
     {{ modification(
         subgraph_number=0,
-        output_name="post_mod_scores",
-        score="qk",
+        output_name="kT",
+        score="kT",
         b="off_z",
         h="off_hq",
-        m="m",
+        m="emb",
         n="n",
-        out="qk"
     ) | indent_except_first(1) }}
+
+    qk = tl.dot(q, kT, input_precision=FLOAT32_PRECISION)
+    if not PRESCALE_QK:
+        qk *= SM_SCALE
+    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+    pre_mod_scores = qk
+
+    post_mod_scores = qk
 
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
@@ -1523,27 +1545,31 @@ def bwd_dkdv_block_mn(
         qT = tl.load(qT_ptrs, mask=offs_m1[None, :] < Q_LEN)
         lse = tl.load(LSE + offs_m1, mask=offs_m1 < Q_LEN)
     lse = tl.where(lse == -float("inf"), 0.0, lse)
-    qkT = tl.dot(k, qT, input_precision=FLOAT32_PRECISION)
-    if not PRESCALE_QK:
-        qkT *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+
     if CHECK_BLOCK_BOUNDARY:
         m = offs_m1[None, :] % Q_LEN
         n = offs_n1[:, None] % KV_LEN
     else:
         m = offs_m1[None, :]
         n = offs_n1[:, None]
-    pre_mod_scores = qkT
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb = inner[None, :]
     {{ modification(
         subgraph_number=0,
-        output_name="post_mod_scores",
-        score="qkT",
+        output_name="k",
+        score="k",
         b="off_z",
         h="off_hq",
-        m="m",
+        m="emb",
         n="n",
-        out="qkT"
     ) | indent_except_first(1) }}
+
+    qkT = tl.dot(k, qT, input_precision=FLOAT32_PRECISION)
+    if not PRESCALE_QK:
+        qkT *= SM_SCALE
+    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+    pre_mod_scores = qkT
+    post_mod_scores = qkT
 
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
