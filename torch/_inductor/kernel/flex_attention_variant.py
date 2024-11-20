@@ -272,6 +272,19 @@ compute_flex_attention_variant = r"""
         # boundary check is not free, so we only do it when necessary.
         q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option = "zero")
 
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb = inner[None, :]
+
+    {{ modification(
+        subgraph_number=0,
+        output_name="q",
+        score="q",
+        b="off_zq",
+        h="off_hq",
+        m="offs_m[:, None]",
+        n="emb",
+    ) | indent_except_first(1) }}
+
     # ~~~~~~~~~~~~~~ normal blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # We don't know anything "special" about these blocks, so we need to apply
     # both score_mod and mask_mod to it
@@ -479,18 +492,6 @@ def forward_block_mn(
         m = offs_m
         n = offs_n
 
-    inner = tl.arange(0, QK_HEAD_DIM)
-    emb = inner[:, None]
-
-    {{ modification(
-        subgraph_number=0,
-        output_name="k",
-        score="k",
-        b="off_z",
-        h="off_h",
-        m="emb",
-        n="n",
-    ) | indent_except_first(1) }}
     # -- compute qk ---
     qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION) # TODO: use cuda matmul when q_len <= 2.
     if not PRESCALE_QK:
@@ -1092,6 +1093,20 @@ flex_attention_variant_backward_template = TritonTemplate(
             q = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd, mask=offs_m2[:, None] < Q_LEN)
             do = tl.load(DO2 + offs_m2[:, None] * stride_dom + offs_v[None, :] * stride_dod, mask=offs_m2[:, None] < Q_LEN)
 
+        inner = tl.arange(0, QK_HEAD_DIM)
+        emb = inner[None, :]
+        off_m = offs_m2[:, None]
+
+        {{ modification(
+            subgraph_number=0,
+            output_name="q",
+            score="q",
+            b="off_zq",
+            h="off_hq2",
+            m="off_m",
+            n="emb",
+        ) | indent_except_first(2) }}
+        
         if PRESCALE_QK:
             q = (q * SM_SCALE * RCP_LN2).to(MATMUL_PRECISION)
 
@@ -1362,19 +1377,6 @@ def bwd_dq_block_mn(
         m = offs_m2[:, None]
         n = offs_n2[None, :]
 
-    inner = tl.arange(0, QK_HEAD_DIM)
-    emb = inner[:, None]
-
-    {{ modification(
-        subgraph_number=0,
-        output_name="kT",
-        score="kT",
-        b="off_z",
-        h="off_hq",
-        m="emb",
-        n="n",
-    ) | indent_except_first(1) }}
-
     qk = tl.dot(q, kT, input_precision=FLOAT32_PRECISION)
     if not PRESCALE_QK:
         qk *= SM_SCALE
@@ -1552,16 +1554,17 @@ def bwd_dkdv_block_mn(
     else:
         m = offs_m1[None, :]
         n = offs_n1[:, None]
+
     inner = tl.arange(0, QK_HEAD_DIM)
-    emb = inner[None, :]
+    emb = inner[:, None]
     {{ modification(
         subgraph_number=0,
-        output_name="k",
-        score="k",
+        output_name="qT",
+        score="qT",
         b="off_z",
         h="off_hq",
-        m="emb",
-        n="n",
+        m="m",
+        n="emb",
     ) | indent_except_first(1) }}
 
     qkT = tl.dot(k, qT, input_precision=FLOAT32_PRECISION)
