@@ -169,19 +169,18 @@ def _math_attention_inner(
 
     working_precision = torch.float64 if query.dtype == torch.float64 else torch.float32
 
-    scores = (query @ key.transpose(-2, -1)).to(dtype=working_precision)
-
-    b = torch.arange(0, scores.size(0), device=scores.device)
-    h = torch.arange(0, scores.size(1), device=scores.device)
-    m = torch.arange(0, scores.size(2), device=scores.device)
-    n = torch.arange(0, scores.size(3), device=scores.device)
-
     captured_buffers_in_dim = (None,) * len(score_mod_other_buffers)
     from torch.nn.attention.flex_attention_variant import _vmap_for_bhqkv
 
     # first input is score
     score_mod = _vmap_for_bhqkv(score_mod, prefix=(0,), suffix=captured_buffers_in_dim)
-
+    b = torch.arange(0, query.size(0), device=query.device)
+    h = torch.arange(0, query.size(1), device=query.device)
+    m = torch.arange(0, query.size(2), device=query.device)
+    n = torch.arange(0, query.size(3), device=query.device)
+    with TransformGetItemToIndex():
+        query = score_mod(query, b, h, m, n, *score_mod_other_buffers)
+    scores = (query @ key.transpose(-2, -1)).to(dtype=working_precision)
     mask_mod = block_mask[-1]
     mask_mod_in_dim_buffers = (None,) * len(mask_mod_other_buffers)
     mask_mod = _vmap_for_bhqkv(mask_mod, prefix=(), suffix=mask_mod_in_dim_buffers)
@@ -189,8 +188,8 @@ def _math_attention_inner(
     with TransformGetItemToIndex():
         scores = (scores * scale).to(working_precision)
         post_mod_scores = torch.where(
-            mask_mod(b, h, m, n, *mask_mod_other_buffers),
-            score_mod(scores, b, h, m, n, *score_mod_other_buffers),
+            mask_mod(b, h, m, m, *mask_mod_other_buffers),
+            scores,
             torch.tensor(-float("inf"), dtype=working_precision, device=scores.device),
         )
 
@@ -829,10 +828,7 @@ def sdpa_dense_backward(
         suffix=(0,) + captured_buffers_in_dim,
         out_dims=out_dims,
     )
-    with TransformGetItemToIndex():
-        grad_scores, _, _, _, _, *grad_score_mod_captured = joint_score_mod(
-            scores, b, h, m, n, grad_score_mod, *score_mod_other_buffers
-        )
+    grad_scores = grad_score_mod
     grad_scores = grad_scores * scale
     grad_scores = grad_scores.to(query.dtype)
 
@@ -845,8 +841,24 @@ def sdpa_dense_backward(
             mask_scores, grad_scores, torch.tensor(0, dtype=query.dtype)
         )
 
-    grad_query = grad_scores @ key
-    grad_key = grad_scores.transpose(-2, -1) @ query
+    grad_query_mod = grad_scores @ key
+    b = torch.arange(0, query.size(0), device=query.device)
+    h = torch.arange(0, query.size(1), device=query.device)
+    m = torch.arange(0, query.size(2), device=query.device)
+    n = torch.arange(0, query.size(3), device=query.device)
+
+    with TransformGetItemToIndex():
+        grad_query, _, _, _, _, *grad_score_mod_captured = joint_score_mod(
+            query, b, h, m, n, grad_query_mod, *score_mod_other_buffers
+        )
+
+    captured_buffers_in_dim = (None,) * len(score_mod_other_buffers)
+    score_mod = _vmap_for_bhqkv(fw_graph, prefix=(0,), suffix=captured_buffers_in_dim)
+    with TransformGetItemToIndex():
+        query_mod = score_mod(query, b, h, m, n, *score_mod_other_buffers)
+
+
+    grad_key = grad_scores.transpose(-2, -1) @ query_mod
 
     # Reduce DK, DV along broadcasted heads.
     grad_key = grad_key.view(

@@ -1087,12 +1087,12 @@ flex_attention_variant_backward_template = TritonTemplate(
 
         # load Q and do: they stay in SRAM throughout the inner loop.
         if IS_DIVISIBLE:
-            q = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd)
+            q_pre_mod = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd)
             do = tl.load(DO2 + offs_m2[:, None] * stride_dom + offs_v[None, :] * stride_dod)
         else:
-            q = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd, mask=offs_m2[:, None] < Q_LEN)
+            q_pre_mod = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd, mask=offs_m2[:, None] < Q_LEN)
             do = tl.load(DO2 + offs_m2[:, None] * stride_dom + offs_v[None, :] * stride_dod, mask=offs_m2[:, None] < Q_LEN)
-
+        
         inner = tl.arange(0, QK_HEAD_DIM)
         emb = inner[None, :]
         off_m = offs_m2[:, None]
@@ -1100,7 +1100,7 @@ flex_attention_variant_backward_template = TritonTemplate(
         {{ modification(
             subgraph_number=0,
             output_name="q",
-            score="q",
+            score="q_pre_mod",
             b="off_zq",
             h="off_hq2",
             m="off_m",
@@ -1159,6 +1159,22 @@ flex_attention_variant_backward_template = TritonTemplate(
         # Write back dQ.
         dq_ptrs = DQ2 + offs_m2[:, None] * stride_dqm + offs_k[None, :] * stride_dqd
         dq *= SM_SCALE
+
+        inner = tl.arange(0, QK_HEAD_DIM)
+        emb = inner[None, :]
+        off_m = offs_m2[:, None]
+
+        {{ modification(
+            subgraph_number=1,
+            output_name = "dq",
+            score="q_pre_mod",
+            b="off_zq",
+            h="off_hq2",
+            m="off_m",
+            n="emb",
+            grad_score_mod="dq"
+        ) | indent_except_first(2) }}
+
         if IS_DIVISIBLE:
             tl.store(dq_ptrs, dq)
         else:
@@ -1381,8 +1397,6 @@ def bwd_dq_block_mn(
     if not PRESCALE_QK:
         qk *= SM_SCALE
     # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-    pre_mod_scores = qk
-
     post_mod_scores = qk
 
     if CHECK_BLOCK_BOUNDARY:
@@ -1415,21 +1429,8 @@ def bwd_dq_block_mn(
         vT = tl.load(vT_ptrs, mask=offs_n2[None, :] < KV_LEN)
     dp = tl.dot(do, vT, input_precision=FLOAT32_PRECISION)
     ds = p * (dp - Di[:, None])
-    # ~~~~~~~~~~~~~~~~~~~ Apply joint modification  ~~~~~~~~~~~~~~~~~~~
-    {{ modification(
-        subgraph_number=1,
-        output_name = "grad_scores",
-        score="pre_mod_scores",
-        b="off_z",
-        h="off_hq",
-        m="m",
-        n="n",
-        grad_score_mod="ds"
-    ) | indent_except_first(1) }}
     if CHECK_BLOCK_BOUNDARY:
-        grad_scores = tl.where(offs_n2[None, :] < KV_LEN, grad_scores, 0.0)
-
-    ds = grad_scores
+        ds = tl.where(offs_n2[None, :] < KV_LEN, ds, 0.0)
 
     if not IS_FULL_BLOCKS:
         if CHECK_BLOCK_BOUNDARY:
@@ -1571,7 +1572,6 @@ def bwd_dkdv_block_mn(
     if not PRESCALE_QK:
         qkT *= SM_SCALE
     # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-    pre_mod_scores = qkT
     post_mod_scores = qkT
 
     if CHECK_BLOCK_BOUNDARY:
@@ -1610,21 +1610,9 @@ def bwd_dkdv_block_mn(
     # Compute dP and dS.
     dpT = tl.dot(v, tl.trans(do), input_precision=FLOAT32_PRECISION)
     dsT = pT * (dpT - Di[None, :])
-    # ~~~~~~~~~~~~~~~~~~~ Apply joint modification  ~~~~~~~~~~~~~~~~~~~
-    {{ modification(
-        subgraph_number=1,
-        output_name = "grad_scores",
-        score="pre_mod_scores",
-        b="off_z",
-        h="off_hq",
-        m="m",
-        n="n",
-        grad_score_mod="dsT"
-    ) | indent_except_first(1) }}
     if CHECK_BLOCK_BOUNDARY:
-        grad_scores = tl.where(offs_n1[:, None] < KV_LEN, grad_scores, 0.0)
+        dsT = tl.where(offs_n1[:, None] < KV_LEN, dsT, 0.0)
 
-    dsT = grad_scores
     if not IS_FULL_BLOCKS:
         if CHECK_BLOCK_BOUNDARY:
             mask_mod_output = tl.where(offs_n1[:, None] < KV_LEN, mask_mod_output, float("-inf"))
