@@ -179,8 +179,8 @@ def _math_attention_inner(
     m = torch.arange(0, key.size(2), device=key.device)
     n = torch.arange(0, key.size(3), device=key.device)
     with TransformGetItemToIndex():
-        key = score_mod(key, b, h, m, n, *score_mod_other_buffers)
-    scores = (query @ key.transpose(-2, -1)).to(dtype=working_precision)
+        key_transposed = score_mod(key.transpose(-2,-1), b, h, n, m, *score_mod_other_buffers)
+    scores = (query @ key_transposed).to(dtype=working_precision)
     mask_mod = block_mask[-1]
     mask_mod_in_dim_buffers = (None,) * len(mask_mod_other_buffers)
     mask_mod = _vmap_for_bhqkv(mask_mod, prefix=(), suffix=mask_mod_in_dim_buffers)
@@ -840,7 +840,8 @@ def sdpa_dense_backward(
     captured_buffers_in_dim = (None,) * len(score_mod_other_buffers)
     score_mod = _vmap_for_bhqkv(fw_graph, prefix=(0,), suffix=captured_buffers_in_dim)
     with TransformGetItemToIndex():
-        k_mod = score_mod(key, b, h, m, n, *score_mod_other_buffers)
+        k_mod = score_mod(key.transpose(-2,-1), b, h, n, m, *score_mod_other_buffers)
+    k_mod = k_mod.transpose(-2,-1)
 
     grad_query = grad_scores @ k_mod
     grad_key_mod = grad_scores.transpose(-2, -1) @ query
@@ -855,8 +856,9 @@ def sdpa_dense_backward(
     )
     with TransformGetItemToIndex():
         grad_key, _, _, _, _, *grad_score_mod_captured = joint_score_mod(
-            key, b, h, m, n, grad_key_mod, *score_mod_other_buffers
+            key.transpose(-2,-1), b, h, n, m, grad_key_mod.transpose(-2,-1), *score_mod_other_buffers
         )
+    grad_key = grad_key.transpose(-2,-1)
 
     # Reduce DK, DV along broadcasted heads.
     grad_key = grad_key.view(
