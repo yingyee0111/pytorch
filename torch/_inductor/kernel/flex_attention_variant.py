@@ -467,11 +467,8 @@ def forward_block_mn(
         k = tl.load(K_block_ptr)
     else:
         k = tl.load(K_block_ptr, boundary_check=(1,), padding_option = "zero")
-    # -- compute qk ---
-    qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION) # TODO: use cuda matmul when q_len <= 2.
-    if not PRESCALE_QK:
-        qk *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+
+    # ~~~~~~~~~~~~~~~~~~~ Apply k modification  ~~~~~~~~~~~~~~~~~~~
     if CHECK_BLOCK_BOUNDARY:
         # If this is the last block of a non divisible seqlen, we still need to load [BLOCK_M, BLOCK_N] elements,
         # which is larger than the actual number of elements. To avoid access memory out of bound,
@@ -481,18 +478,25 @@ def forward_block_mn(
     else:
         m = offs_m
         n = offs_n
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb = inner[:, None]
 
     {{ modification(
         subgraph_number=0,
-        output_name="post_mod_scores",
-        score="qk",
+        output_name="k",
+        score="k",
         b="off_z",
         h="off_h",
-        m="m",
+        m="emb",
         n="n",
-        out="qk"
     ) | indent_except_first(1) }}
 
+    # -- compute qk ---
+    qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION) # TODO: use cuda matmul when q_len <= 2.
+    if not PRESCALE_QK:
+        qk *= SM_SCALE
+
+    post_mod_scores = qk
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
         post_mod_scores = tl.where(offs_n < KV_LEN, post_mod_scores, float("-inf"))
@@ -1152,11 +1156,28 @@ flex_attention_variant_backward_template = TritonTemplate(
 
         # load K and V: they stay in SRAM throughout the inner loop.
         if IS_DIVISIBLE:
-            k = tl.load(K + offs_n1[:, None] * stride_kn + offs_k[None, :] * stride_kd)
+            k_pre_mod = tl.load(K + offs_n1[:, None] * stride_kn + offs_k[None, :] * stride_kd)
             v = tl.load(V + offs_n1[:, None] * stride_vn + offs_v[None, :] * stride_vd)
         else:
-            k = tl.load(K + offs_n1[:, None] * stride_kn + offs_k[None, :] * stride_kd, mask=offs_n1[:, None] < KV_LEN)
+            k_pre_mod = tl.load(K + offs_n1[:, None] * stride_kn + offs_k[None, :] * stride_kd, mask=offs_n1[:, None] < KV_LEN)
             v = tl.load(V + offs_n1[:, None] * stride_vn + offs_v[None, :] * stride_vd, mask=offs_n1[:, None] < KV_LEN)
+        
+        
+        # ~~~~~~~~~~~~~~~~~~~ Apply k modification  ~~~~~~~~~~~~~~~~~~~
+        off_n = offs_n1[:, None]
+        inner = tl.arange(0, QK_HEAD_DIM)
+        emb = inner[None, :]
+
+        {{ modification(
+            subgraph_number=0,
+            output_name="k",
+            score="k_pre_mod",
+            b="off_zq",
+            h="off_hq1",
+            m="emb",
+            n="off_n",
+        ) | indent_except_first(2) }}
+
         if PRESCALE_QK:
             k = (k * SM_SCALE * RCP_LN2).to(MATMUL_PRECISION)
 
@@ -1233,6 +1254,22 @@ flex_attention_variant_backward_template = TritonTemplate(
 
         dk *= SM_SCALE
         mask = index_n < KV_LEN
+
+        # ~~~~~~~~~~~~~~~~~~~ Apply reverse k modification  ~~~~~~~~~~~~~~~~~~~
+        off_n = offs_n1[:, None]
+        inner = tl.arange(0, QK_HEAD_DIM)
+        emb = inner[None, :]
+
+        {{ modification(
+            subgraph_number=1,
+            output_name = "dk",
+            score="k_pre_mod",
+            b="off_zq",
+            h="off_hq1",
+            m="emb",
+            n="off_n",
+            grad_score_mod="dk"
+        ) | indent_except_first(2) }}
 
         # first compute broadcasted dk of shape [Bq, Hkv, KV_LEN, V_HEAD_DIM]
         # then reduce to dk of shape [Bkv, Hkv, KV_LEN, V_HEAD_DIM]
@@ -1339,27 +1376,32 @@ def bwd_dq_block_mn(
         kT = tl.load(kT_ptrs)
     else:
         kT = tl.load(kT_ptrs, mask=offs_n2[None, :] < KV_LEN)
-    qk = tl.dot(q, kT, input_precision=FLOAT32_PRECISION)
-    if not PRESCALE_QK:
-        qk *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-    pre_mod_scores = qk
+
+    # ~~~~~~~~~~~~~~~~~~~ Apply k modification  ~~~~~~~~~~~~~~~~~~~
     if CHECK_BLOCK_BOUNDARY:
         m = offs_m2[:, None] % Q_LEN
         n = offs_n2[None, :] % KV_LEN
     else:
         m = offs_m2[:, None]
         n = offs_n2[None, :]
+
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb = inner[:, None]
     {{ modification(
         subgraph_number=0,
-        output_name="post_mod_scores",
-        score="qk",
+        output_name="kT",
+        score="kT",
         b="off_z",
         h="off_hq",
-        m="m",
+        m="emb",
         n="n",
-        out="qk"
     ) | indent_except_first(1) }}
+    
+    qk = tl.dot(q, kT, input_precision=FLOAT32_PRECISION)
+    if not PRESCALE_QK:
+        qk *= SM_SCALE
+    
+    post_mod_scores = qk
 
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
@@ -1391,21 +1433,9 @@ def bwd_dq_block_mn(
         vT = tl.load(vT_ptrs, mask=offs_n2[None, :] < KV_LEN)
     dp = tl.dot(do, vT, input_precision=FLOAT32_PRECISION)
     ds = p * (dp - Di[:, None])
-    # ~~~~~~~~~~~~~~~~~~~ Apply joint modification  ~~~~~~~~~~~~~~~~~~~
-    {{ modification(
-        subgraph_number=1,
-        output_name = "grad_scores",
-        score="pre_mod_scores",
-        b="off_z",
-        h="off_hq",
-        m="m",
-        n="n",
-        grad_score_mod="ds"
-    ) | indent_except_first(1) }}
-    if CHECK_BLOCK_BOUNDARY:
-        grad_scores = tl.where(offs_n2[None, :] < KV_LEN, grad_scores, 0.0)
 
-    ds = grad_scores
+    if CHECK_BLOCK_BOUNDARY:
+        ds = tl.where(offs_n2[None, :] < KV_LEN, ds, 0.0)
 
     if not IS_FULL_BLOCKS:
         if CHECK_BLOCK_BOUNDARY:
@@ -1526,24 +1556,15 @@ def bwd_dkdv_block_mn(
     qkT = tl.dot(k, qT, input_precision=FLOAT32_PRECISION)
     if not PRESCALE_QK:
         qkT *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    post_mod_scores = qkT
+
     if CHECK_BLOCK_BOUNDARY:
         m = offs_m1[None, :] % Q_LEN
         n = offs_n1[:, None] % KV_LEN
     else:
         m = offs_m1[None, :]
         n = offs_n1[:, None]
-    pre_mod_scores = qkT
-    {{ modification(
-        subgraph_number=0,
-        output_name="post_mod_scores",
-        score="qkT",
-        b="off_z",
-        h="off_hq",
-        m="m",
-        n="n",
-        out="qkT"
-    ) | indent_except_first(1) }}
 
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
@@ -1581,21 +1602,9 @@ def bwd_dkdv_block_mn(
     # Compute dP and dS.
     dpT = tl.dot(v, tl.trans(do), input_precision=FLOAT32_PRECISION)
     dsT = pT * (dpT - Di[None, :])
-    # ~~~~~~~~~~~~~~~~~~~ Apply joint modification  ~~~~~~~~~~~~~~~~~~~
-    {{ modification(
-        subgraph_number=1,
-        output_name = "grad_scores",
-        score="pre_mod_scores",
-        b="off_z",
-        h="off_hq",
-        m="m",
-        n="n",
-        grad_score_mod="dsT"
-    ) | indent_except_first(1) }}
     if CHECK_BLOCK_BOUNDARY:
-        grad_scores = tl.where(offs_n1[:, None] < KV_LEN, grad_scores, 0.0)
+        dsT = tl.where(offs_n1[:, None] < KV_LEN, dsT, 0.0)
 
-    dsT = grad_scores
     if not IS_FULL_BLOCKS:
         if CHECK_BLOCK_BOUNDARY:
             mask_mod_output = tl.where(offs_n1[:, None] < KV_LEN, mask_mod_output, float("-inf"))
