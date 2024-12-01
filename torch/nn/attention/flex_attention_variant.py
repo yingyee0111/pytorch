@@ -949,6 +949,7 @@ def flex_attention_variant(
     key: Tensor,
     value: Tensor,
     score_mod: Optional[_score_mod_signature] = None,
+    q_mod: Optional[_score_mod_signature] = None,
     block_mask: Optional[BlockMask] = None,
     scale: Optional[float] = None,
     enable_gqa: bool = False,
@@ -1030,6 +1031,8 @@ def flex_attention_variant(
 
     if score_mod is None:
         score_mod = _identity
+    if q_mod is None:
+        q_mod = _identity
     if block_mask is None:
         block_mask = _create_empty_block_mask(query, key)
     elif (
@@ -1062,7 +1065,7 @@ def flex_attention_variant(
             torch._dynamo.mark_static(x, -3)
             torch._dynamo.mark_static(x, -1)
         out, lse = flex_attention_variant_hop(
-            query, key, value, score_mod, block_mask.as_tuple(), scale, kernel_options  # type: ignore[union-attr]
+            query, key, value, score_mod, q_mod, block_mask.as_tuple(), scale, kernel_options  # type: ignore[union-attr]
         )
         if return_lse:
             return out, lse * math.log(2)
@@ -1098,6 +1101,7 @@ def flex_attention_variant(
                         key,
                         value,
                         score_mod,
+                        q_mod,
                         block_mask.as_tuple(),  # type: ignore[union-attr]
                         scale,
                         kernel_options,

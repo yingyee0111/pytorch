@@ -2214,7 +2214,7 @@ class FlexAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
 class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
     @staticmethod
     def normalize_to_args(args, kwargs):
-        # input signature is (query, key, value, score_mod, block_mask, *other_buffers),
+        # input signature is (query, key, value, score_mod, q_mod, block_mask, *other_buffers),
         # block_mask is a tuple, and we don't want to flatten it.
         # only flatten kwargs into lists
         flat_kwargs = pytree.tree_flatten(kwargs)[0]
@@ -2245,7 +2245,7 @@ class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
             )
 
         bhmn = [create_scalar() for _ in range(4)]
-        if fn_name == "score_mod":
+        if fn_name == "score_mod" or fn_name == "q_mod":
             scores_require_grad: bool = query.requires_grad
             score = query.call_method(
                 tx,
@@ -2304,6 +2304,7 @@ class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
             key,
             value,
             score_mod,
+            q_mod,
             block_mask,
             scale,
             kernel_options,
@@ -2311,6 +2312,9 @@ class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
 
         score_mod_node, score_mod_lifted_args = self.create_wrapped_node(
             tx, query, score_mod, "score_mod"
+        )
+        q_mod_node, q_mod_lifted_args = self.create_wrapped_node(
+            tx, query, q_mod, "q_mod"
         )
         mask_fn = block_mask.items[-1]
         if isinstance(mask_fn, ConstantVariable):
@@ -2344,8 +2348,8 @@ class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
 
         # Compose the ordered HOO args:
         # - inp_args: [query, key, value, block_mask, scale, kernel_options]
-        # - subgraph node: [score_mod, mask_fn_node]
-        # - lifted args from tracing subgraph: [score_mod_other_buffers, mask_fn_other_buffers]
+        # - subgraph node: [score_mod, q_mod, mask_fn_node]
+        # - lifted args from tracing subgraph: [score_mod_other_buffers, q_mod_other_buffers, mask_fn_other_buffers]
         _, _, _, inp_arg_block_mask, inp_arg_scale, inp_arg_kernel_options = inp_args
         block_mask = tuple(inp_arg_block_mask + (mask_fn_node,))
         return wrap_fx_proxy(
@@ -2356,10 +2360,12 @@ class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
                 args=inp_args[:3]
                 + (
                     score_mod_node,
+                    q_mod_node,
                     block_mask,
                     inp_arg_scale,
                     inp_arg_kernel_options,
                     score_mod_lifted_args,
+                    q_mod_lifted_args,
                     mask_fn_lifted_args,
                 ),
                 kwargs={},

@@ -272,6 +272,20 @@ compute_flex_attention_variant = r"""
         # boundary check is not free, so we only do it when necessary.
         q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option = "zero")
 
+    # ~~~~~~~~~~~~~~ q mod ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb_q = inner[None, :]
+
+    {{ modification(
+        subgraph_number=1,
+        output_name="q",
+        score="q",
+        b="off_zq",
+        h="off_hq",
+        m="offs_m[:, None]",
+        n="emb_q",
+    ) | indent_except_first(1) }}
+
     # ~~~~~~~~~~~~~~ normal blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # We don't know anything "special" about these blocks, so we need to apply
     # both score_mod and mask_mod to it
@@ -499,7 +513,7 @@ def forward_block_mn(
 
     if not IS_FULL_BLOCKS:
         {{ modification(
-            subgraph_number=1,
+            subgraph_number=2,
             output_name="mask_mod_output",
             score="qk",
             b="off_z",
@@ -683,10 +697,12 @@ def flex_attention_variant(
     key,
     value,
     subgraph,
+    subgraph_q,
     block_mask,
     scale,
     kernel_options,
     score_mod_other_buffers,
+    q_mod_other_buffers,
     mask_mod_other_buffers,
 ):
     (
@@ -715,6 +731,19 @@ def flex_attention_variant(
     subgraph_buffer = build_subgraph_buffer(
         placeholder_inps + list(score_mod_other_buffers), subgraph
     )
+    q_placeholder_inps = [
+        create_placeholder(name, dtype, query.get_device())
+        for name, dtype in [
+            ("score", query.get_dtype()),
+            ("b", torch.int32),
+            ("h", torch.int32),
+            ("m", torch.int32),
+            ("n", torch.int32),
+        ]
+    ]
+    q_subgraph_buffer = build_subgraph_buffer(
+        q_placeholder_inps + list(q_mod_other_buffers), subgraph_q
+    )
     mask_graph_placeholder_inps = [
         create_placeholder(name, dtype, query.get_device())
         for name, dtype in [
@@ -738,8 +767,10 @@ def flex_attention_variant(
             scale,
             kernel_options,
             subgraph_buffer,
+            q_subgraph_buffer,
             mask_graph_buffer,
             score_mod_other_buffers,
+            q_mod_other_buffers,
             mask_mod_other_buffers,
         )
 
@@ -772,6 +803,7 @@ def flex_attention_variant(
     )
 
     score_mod_other_buffers = maybe_realize(score_mod_other_buffers)
+    q_mod_other_buffers = maybe_realize(q_mod_other_buffers)
     mask_mod_other_buffers = maybe_realize(mask_mod_other_buffers)
 
     Bq, Hq, seq_len_q, qk_head_dim = query.get_size()
@@ -883,6 +915,7 @@ def flex_attention_variant(
             layout=layout,
             subgraphs=[
                 subgraph_buffer,
+                q_subgraph_buffer,
                 mask_graph_buffer,
             ],
             mutated_inputs=[
@@ -905,6 +938,7 @@ def flex_attention_variant(
             full_kv_indices,
         ]
         + list(score_mod_other_buffers)
+        + list(q_mod_other_buffers)
         + list(mask_mod_other_buffers)
     )
     input_gen_fns = {
@@ -1071,12 +1105,27 @@ flex_attention_variant_backward_template = TritonTemplate(
 
         # load Q and do: they stay in SRAM throughout the inner loop.
         if IS_DIVISIBLE:
-            q = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd)
+            q_pre_mod = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd)
             do = tl.load(DO2 + offs_m2[:, None] * stride_dom + offs_v[None, :] * stride_dod)
         else:
-            q = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd, mask=offs_m2[:, None] < Q_LEN)
+            q_pre_mod = tl.load(Q2 + offs_m2[:, None] * stride_qm + offs_k[None, :] * stride_qd, mask=offs_m2[:, None] < Q_LEN)
             do = tl.load(DO2 + offs_m2[:, None] * stride_dom + offs_v[None, :] * stride_dod, mask=offs_m2[:, None] < Q_LEN)
 
+        # ~~~~~~~~~~~ q mod ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        inner = tl.arange(0, QK_HEAD_DIM)
+        emb_q = inner[None, :]
+        off_m = offs_m2[:, None]
+
+        {{ modification(
+            subgraph_number=2,
+            output_name="q",
+            score="q_pre_mod",
+            b="off_zq",
+            h="off_hq2",
+            m="off_m",
+            n="emb_q",
+        ) | indent_except_first(2) }}
+        
         if PRESCALE_QK:
             q = (q * SM_SCALE * RCP_LN2).to(MATMUL_PRECISION)
 
@@ -1129,6 +1178,24 @@ flex_attention_variant_backward_template = TritonTemplate(
         # Write back dQ.
         dq_ptrs = DQ2 + offs_m2[:, None] * stride_dqm + offs_k[None, :] * stride_dqd
         dq *= SM_SCALE
+
+        # ~~~~~~~~~~~ q joint ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        inner = tl.arange(0, QK_HEAD_DIM)
+        emb_q = inner[None, :]
+        off_m = offs_m2[:, None]
+
+        {{ modification(
+            subgraph_number=3,
+            output_name = "dq",
+            score="q_pre_mod",
+            b="off_zq",
+            h="off_hq2",
+            m="off_m",
+            n="emb_q",
+            grad_q_mod="dq"
+        ) | indent_except_first(2) }}
+
+        
         if IS_DIVISIBLE:
             tl.store(dq_ptrs, dq)
         else:
@@ -1367,7 +1434,7 @@ def bwd_dq_block_mn(
 
     if not IS_FULL_BLOCKS:
         {{ modification(
-            subgraph_number=2,
+            subgraph_number=4,
             output_name="mask_mod_output",
             score="qk",
             b="off_z",
@@ -1523,16 +1590,31 @@ def bwd_dkdv_block_mn(
         qT = tl.load(qT_ptrs, mask=offs_m1[None, :] < Q_LEN)
         lse = tl.load(LSE + offs_m1, mask=offs_m1 < Q_LEN)
     lse = tl.where(lse == -float("inf"), 0.0, lse)
-    qkT = tl.dot(k, qT, input_precision=FLOAT32_PRECISION)
-    if not PRESCALE_QK:
-        qkT *= SM_SCALE
-    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
+
+    # ~~~~~~~~~~~~~~~~~~~ q mod  ~~~~~~~~~~~~~~~~~~~
     if CHECK_BLOCK_BOUNDARY:
         m = offs_m1[None, :] % Q_LEN
         n = offs_n1[:, None] % KV_LEN
     else:
         m = offs_m1[None, :]
         n = offs_n1[:, None]
+
+    inner = tl.arange(0, QK_HEAD_DIM)
+    emb_q = inner[:, None]
+    {{ modification(
+        subgraph_number=2,
+        output_name="qT",
+        score="qT",
+        b="off_z",
+        h="off_hq",
+        m="m",
+        n="emb_q",
+    ) | indent_except_first(1) }}
+
+    qkT = tl.dot(k, qT, input_precision=FLOAT32_PRECISION)
+    if not PRESCALE_QK:
+        qkT *= SM_SCALE
+    # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
     pre_mod_scores = qkT
     {{ modification(
         subgraph_number=0,
@@ -1551,7 +1633,7 @@ def bwd_dkdv_block_mn(
 
     if not IS_FULL_BLOCKS:
         {{ modification(
-            subgraph_number=2,
+            subgraph_number=4,
             output_name="mask_mod_output",
             score="qkT",
             b="off_z",
@@ -1625,10 +1707,13 @@ def flex_attention_variant_backward(*args, **kwargs):
         grad_logsumexp,
         fw_graph,
         joint_graph,
+        fw_graph_q,
+        joint_graph_q,
         block_mask,
         scale,
         kernel_options,
         score_mod_other_buffers,
+        q_mod_other_buffers,
         mask_mod_other_buffers,
     ) = args
     (
@@ -1711,6 +1796,27 @@ def flex_attention_variant_backward(*args, **kwargs):
     ]
     joint_subgraph_buffer, *_ = build_subgraph_buffer(
         joint_placeholder_inps + list(score_mod_other_buffers), joint_graph
+    )
+
+    q_fwd_placeholder_inps = [
+        create_placeholder(name, dtype, device)
+        for name, dtype in [
+            ("score", dtype),
+            ("b", torch.int32),
+            ("h", torch.int32),
+            ("m", torch.int32),
+            ("n", torch.int32),
+        ]
+    ]
+    q_fw_subgraph_buffer = build_subgraph_buffer(
+        q_fwd_placeholder_inps + list(q_mod_other_buffers), fw_graph_q
+    )
+
+    q_joint_placeholder_inps = fwd_placeholder_inps + [
+        create_placeholder("grad_q_mod", dtype, device)
+    ]
+    q_joint_subgraph_buffer, *_ = build_subgraph_buffer(
+        q_joint_placeholder_inps + list(q_mod_other_buffers), joint_graph_q
     )
 
     mask_graph_placeholder_inps = [
@@ -1824,7 +1930,7 @@ def flex_attention_variant_backward(*args, **kwargs):
                 full_q_indices,
             ],
             layout=layout_broadcasted_k,  # We use store_output only for grad_key
-            subgraphs=[fw_subgraph_buffer, joint_subgraph_buffer, mask_graph_buffer],
+            subgraphs=[fw_subgraph_buffer, joint_subgraph_buffer, q_fw_subgraph_buffer, q_joint_subgraph_buffer, mask_graph_buffer],
             mutated_inputs=[grad_query, broadcasted_grad_value],
             call_sizes=query.get_size() + key.get_size()[1:3],
             num_stages=num_stages,
@@ -1851,6 +1957,7 @@ def flex_attention_variant_backward(*args, **kwargs):
             full_q_indices,
         ]
         + list(score_mod_other_buffers)
+        + list(q_mod_other_buffers)
         + list(mask_mod_other_buffers)
     )
     input_gen_fns = {
