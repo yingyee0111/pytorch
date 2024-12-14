@@ -602,6 +602,8 @@ class TorchHigherOrderOperatorVariable(VariableTracker):
             return HintsWrapperHigherOrderVariable(value, source, **kwargs)
         elif value.__name__ == "flex_attention":
             return FlexAttentionHigherOrderVariable(value, source, **kwargs)
+        elif value.__name__ == "flex_attention_variant":
+            return FlexAttentionVariantHigherOrderVariable(value, source, **kwargs)
         elif value.__name__ in (
             "wrap_activation_checkpoint",
             "tag_activation_checkpoint",
@@ -2201,6 +2203,169 @@ class FlexAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
                     inp_arg_scale,
                     inp_arg_kernel_options,
                     score_mod_lifted_args,
+                    mask_fn_lifted_args,
+                ),
+                kwargs={},
+            ),
+            example_value=example_value,
+        )
+
+
+class FlexAttentionVariantHigherOrderVariable(TorchHigherOrderOperatorVariable):
+    @staticmethod
+    def normalize_to_args(args, kwargs):
+        # input signature is (query, key, value, k_mod, q_mod, block_mask, *other_buffers),
+        # block_mask is a tuple, and we don't want to flatten it.
+        # only flatten kwargs into lists
+        flat_kwargs = pytree.tree_flatten(kwargs)[0]
+
+        # Combine the flattened lists
+        all_args = args + flat_kwargs
+        return all_args
+
+    def create_wrapped_node(
+        self,
+        tx: "InstructionTranslator",
+        query: "VariableTracker",
+        fn: "VariableTracker",
+        fn_name: str,
+    ):
+        from .._trace_wrapped_higher_order_op import TransformGetItemToIndex
+
+        tx: InstructionTranslator = tx
+
+        def create_scalar():
+            return query.call_method(
+                tx,
+                "new_empty",
+                (VariableTracker.build(tx, []),),
+                {
+                    "dtype": VariableTracker.build(tx, torch.int32),
+                },
+            )
+
+        bhmn = [create_scalar() for _ in range(4)]
+        if fn_name == "k_mod" or fn_name == "q_mod":
+            mod_elem_require_grad: bool = query.requires_grad
+            mod_elem = query.call_method(
+                tx,
+                "new_empty",
+                (VariableTracker.build(tx, []),),
+                {"requires_grad": VariableTracker.build(tx, mod_elem_require_grad)},
+            )
+            new_args = [mod_elem, *bhmn]
+        else:
+            assert fn_name == "mask_fn", "Illegal function name: " + fn_name
+            new_args = [*bhmn]
+
+        with TransformGetItemToIndex():
+            (
+                (body_output, body_treespec),
+                body_graph,
+                body_lifted_freevars,
+            ) = speculate_subgraph(
+                tx,
+                fn,
+                new_args,
+                {},  # expect only args no kwargs for now
+                description=fn_name,
+                source_target=self.value,
+                set_subgraph_inputs="flatten_manual",
+            )
+
+        body_name = add_subgraph(
+            tx,
+            fn_name,
+            torch.fx.GraphModule(tx.output.nn_modules, body_graph),
+        )
+
+        body_node = make_attr(tx, body_name)
+
+        # It is possible that the score-mod function captures some free variables that are not
+        # passed in as arguments. In this case, we need to lift them, which is handled by speculate_subgraph.
+        # We then need to create proxies for this + the inputs.
+
+        lifted_args = tuple(arg for arg in body_lifted_freevars.keys())
+
+        proxy_args = (body_node, lifted_args)
+
+        return proxy_args
+
+    def call_function(
+        self,
+        tx: "InstructionTranslator",
+        args: "List[VariableTracker]",
+        kwargs: "Dict[str, VariableTracker]",
+    ) -> "VariableTracker":
+        from .builder import wrap_fx_proxy
+
+        (
+            query,
+            key,
+            value,
+            k_mod,
+            q_mod,
+            block_mask,
+            scale,
+            kernel_options,
+        ) = self.normalize_to_args(args, kwargs)
+
+        k_mod_node, k_mod_lifted_args = self.create_wrapped_node(
+            tx, query, k_mod, "k_mod"
+        )
+        q_mod_node, q_mod_lifted_args = self.create_wrapped_node(
+            tx, query, q_mod, "q_mod"
+        )
+        mask_fn = block_mask.items[-1]
+        if isinstance(mask_fn, ConstantVariable):
+            mask_fn = UserFunctionVariable(torch.nn.attention._flex_attention_variant._no_mask)
+        mask_fn_node, mask_fn_lifted_args = self.create_wrapped_node(
+            tx, query, mask_fn, "mask_fn"
+        )
+
+        proxied_args = [
+            query,
+            key,
+            value,
+            TupleVariable(block_mask.items[:-1], source=block_mask.source),
+            scale,
+            kernel_options,
+        ]
+
+        # Store the invocation as a call
+        # Norm_kwargs contains the score_function and we dont want to proxy this because
+        # Proxying user defined functions is not supported.
+        inp_args, _ = proxy_args_kwargs(proxied_args, {})
+
+        query_meta = query.as_proxy().node.meta["example_value"]
+        logsumexp_shape = query_meta.size()[:-1]  # [B, H, M]
+        with torch._guards.TracingContext.try_get().fake_mode:
+            out_meta = torch.empty_like(
+                query_meta, memory_format=torch.contiguous_format
+            )
+            lse_meta = query_meta.new_empty(logsumexp_shape, dtype=torch.float32)
+        example_value = (out_meta, lse_meta)
+
+        # Compose the ordered HOO args:
+        # - inp_args: [query, key, value, block_mask, scale, kernel_options]
+        # - subgraph node: [k_mod, q_mod, mask_fn_node]
+        # - lifted args from tracing subgraph: [k_mod_other_buffers, q_mod_other_buffers, mask_fn_other_buffers]
+        _, _, _, inp_arg_block_mask, inp_arg_scale, inp_arg_kernel_options = inp_args
+        block_mask = tuple(inp_arg_block_mask + (mask_fn_node,))
+        return wrap_fx_proxy(
+            tx=tx,
+            proxy=tx.output.create_proxy(
+                "call_function",
+                self.value,
+                args=inp_args[:3]
+                + (
+                    k_mod_node,
+                    q_mod_node,
+                    block_mask,
+                    inp_arg_scale,
+                    inp_arg_kernel_options,
+                    k_mod_lifted_args,
+                    q_mod_lifted_args,
                     mask_fn_lifted_args,
                 ),
                 kwargs={},

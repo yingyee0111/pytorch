@@ -3998,6 +3998,8 @@ class TritonTemplateBuffer(TemplateBuffer):
             allowed_set = (
                 torch.ops.higher_order.flex_attention,
                 torch.ops.higher_order.flex_attention_backward,
+                torch.ops.higher_order.flex_attention_variant,
+                torch.ops.higher_order.flex_attention_variant_backward,
             )
             current_node = V.graph.current_node.target
             assert (
